@@ -59,6 +59,10 @@ import qualified Control.Exception as E
 import Control.Exception.Extensible ( throwIO )
 import qualified Text.Pandoc.UTF8 as UTF8
 import Control.Monad (when, unless, (>=>))
+import Control.Monad.IO.Class
+import Control.Monad.Par ()
+import Control.Monad.Par.Class
+import Control.Monad.Par.IO
 import Data.Maybe (isJust, fromMaybe)
 import Data.Foldable (foldrM)
 import Network.URI (parseURI, isURI, URI(..))
@@ -1390,4 +1394,6 @@ main = do
                                          handleEntities = if htmlFormat && ascii
                                                              then toEntities
                                                              else id
-  if batch then mapM_ (\(i, o) -> process [i] o) (zip inputFiles outputFiles) else process sources outputFile
+  if batch
+    then runParIO $ mapM_ (\(i, o) -> fork . liftIO $ process [i] o) (zip inputFiles outputFiles)
+    else process sources outputFile
