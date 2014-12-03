@@ -50,6 +50,7 @@ import System.FilePath
 import System.Console.GetOpt
 import Data.Char ( toLower )
 import Data.List ( intercalate, isPrefixOf, isSuffixOf, sort )
+import Data.List.Split ( splitOn )
 import System.Directory ( getAppUserDataDirectory, findExecutable,
                           doesFileExist, Permissions(..), getPermissions )
 import System.IO ( stdout, stderr )
@@ -164,6 +165,8 @@ data Opt = Opt
     , optVariables         :: [(String,String)] -- ^ Template variables to set
     , optMetadata          :: M.Map String MetaValue -- ^ Metadata fields to set
     , optOutputFile        :: String  -- ^ Name of output file
+    , optOutputFiles        :: [String]  -- ^ Names of output files
+    , optInputFiles        :: [String]  -- ^ Names of input files
     , optNumberSections    :: Bool    -- ^ Number sections in LaTeX
     , optNumberOffset      :: [Int]   -- ^ Starting number for sections
     , optSectionDivs       :: Bool    -- ^ Put sections in div tags in HTML
@@ -224,6 +227,8 @@ defaultOpts = Opt
     , optVariables             = []
     , optMetadata              = M.empty
     , optOutputFile            = "-"    -- "-" means stdout
+    , optOutputFiles           = []
+    , optInputFiles            = []
     , optNumberSections        = False
     , optNumberOffset          = [0,0,0,0,0,0]
     , optSectionDivs           = False
@@ -290,6 +295,20 @@ options =
                   (\arg opt -> return opt { optOutputFile = arg })
                   "FILENAME")
                  "" -- "Name of output file"
+
+    , Option "O" ["output-files"]
+                 (ReqArg
+                  (\arg opt -> return opt { optOutputFiles = splitOn "," arg })
+                  "FILENAMES")
+                 ""
+
+    , Option "I" ["input-files"]
+                 (ReqArg
+                  (\arg opt -> return opt { optInputFiles = splitOn "," arg })
+                  "FILENAMES")
+                 ""
+
+      -- UI idea: for parallel builds, have user explicitly give -I and -O options (input and output lists) as comma-separated lists. These will be zipped together and processed in parallel.
 
     , Option "" ["data-dir"]
                  (ReqArg
@@ -1039,6 +1058,8 @@ main = do
               , optTransforms            = transforms
               , optTemplate              = templatePath
               , optOutputFile            = outputFile
+              , optOutputFiles           = outputFiles
+              , optInputFiles            = inputFiles
               , optNumberSections        = numberSections
               , optNumberOffset          = numberFrom
               , optSectionDivs           = sectionDivs
@@ -1084,8 +1105,21 @@ main = do
               , optKaTeXJS               = katexJS
              } = opts
 
+  unless (length inputFiles == length outputFiles) $
+    err 9 "must have same number of input and output files"
+
+  when (outputFile /= "-" && not (null outputFiles)) $
+    err 9 "mixing batch and single processing"
+
+  -- If there's only output file, that's it. If multiple, they must
+  -- all be of the same type, so we can just take the first one to do
+  -- all the parameter inference.
+  let (actualOutput, batch) = case outputFiles of
+        [] -> (outputFile, False)
+        (x:_) -> (x, True)
+
   when dumpArgs $
-    do UTF8.hPutStrLn stdout outputFile
+    do UTF8.hPutStrLn stdout actualOutput
        mapM_ (\arg -> UTF8.hPutStrLn stdout arg) args
        exitWith ExitSuccess
 
@@ -1103,7 +1137,9 @@ main = do
   let filters' = if needsCiteproc then "pandoc-citeproc" : filters
                                   else filters
 
-  let sources = if ignoreArgs then [] else args
+  let sources = if ignoreArgs then []
+                else if batch then inputFiles
+                     else args
 
   datadir <- case mbDataDir of
                   Nothing   -> E.catch
@@ -1122,12 +1158,12 @@ main = do
                           x        -> x
 
   let writerName' = case map toLower writerName of
-                          []        -> defaultWriterName outputFile
+                          []        -> defaultWriterName actualOutput
                           "epub2"   -> "epub"
                           "html4"   -> "html"
                           x         -> x
 
-  let pdfOutput = map toLower (takeExtension outputFile) == ".pdf"
+  let pdfOutput = map toLower (takeExtension actualOutput) == ".pdf"
 
   let laTeXOutput = "latex" `isPrefixOf` writerName' ||
                     "beamer" `isPrefixOf` writerName'
@@ -1229,7 +1265,7 @@ main = do
                       , readerTrackChanges = trackChanges
                       }
 
-  when (not (isTextFormat writerName') && outputFile == "-") $
+  when (not (isTextFormat writerName') && actualOutput == "-") $
     err 5 $ "Cannot write " ++ writerName' ++ " output to stdout.\n" ++
             "Specify an output file using the -o option."
 
@@ -1258,98 +1294,100 @@ main = do
                                then handleIncludes
                                else return
 
-  (doc, media) <-
-     case reader of
-          StringReader r-> (, mempty) <$>
-            (  readSources >=>
-               handleIncludes' . convertTabs . intercalate "\n" >=>
-               r readerOpts ) sources
-          ByteStringReader r -> readFiles sources >>= r readerOpts
-
-  let writerOptions = def { writerStandalone       = standalone',
-                            writerTemplate         = templ,
-                            writerVariables        = variables'',
-                            writerTabStop          = tabStop,
-                            writerTableOfContents  = toc,
-                            writerHTMLMathMethod   = mathMethod,
-                            writerIncremental      = incremental,
-                            writerCiteMethod       = citeMethod,
-                            writerIgnoreNotes      = False,
-                            writerNumberSections   = numberSections,
-                            writerNumberOffset     = numberFrom,
-                            writerSectionDivs      = sectionDivs,
-                            writerReferenceLinks   = referenceLinks,
-                            writerWrapText         = wrap,
-                            writerColumns          = columns,
-                            writerEmailObfuscation = obfuscationMethod,
-                            writerIdentifierPrefix = idPrefix,
-                            writerSourceURL        = sourceURL,
-                            writerUserDataDir      = datadir,
-                            writerHtml5            = html5,
-                            writerHtmlQTags        = htmlQTags,
-                            writerChapters         = chapters,
-                            writerListings         = listings,
-                            writerBeamer           = False,
-                            writerSlideLevel       = slideLevel,
-                            writerHighlight        = highlight,
-                            writerHighlightStyle   = highlightStyle,
-                            writerSetextHeaders    = setextHeaders,
-                            writerTeXLigatures     = texLigatures,
-                            writerEpubMetadata     = epubMetadata,
-                            writerEpubStylesheet   = epubStylesheet,
-                            writerEpubFonts        = epubFonts,
-                            writerEpubChapterLevel = epubChapterLevel,
-                            writerTOCDepth         = epubTOCDepth,
-                            writerReferenceODT     = referenceODT,
-                            writerReferenceDocx    = referenceDocx,
-                            writerMediaBag         = media
-                          }
+--------------------------------------------------------------------------------
+  let process inf out = do (doc, media) <- case reader of
+                             StringReader r-> (, mempty) <$>
+                                 (  readSources >=>
+                                    handleIncludes' . convertTabs . intercalate "\n" >=>
+                                    r readerOpts ) inf
+                             ByteStringReader r -> readFiles inf >>= r readerOpts
 
 
-  doc' <- (maybe return (extractMedia media) mbExtractMedia >=>
-           adjustMetadata metadata >=>
-           applyTransforms transforms >=>
-           applyFilters filters' [writerName']) doc
+                           let writerOptions = def { writerStandalone       = standalone',
+                                                     writerTemplate         = templ,
+                                                     writerVariables        = variables'',
+                                                     writerTabStop          = tabStop,
+                                                     writerTableOfContents  = toc,
+                                                     writerHTMLMathMethod   = mathMethod,
+                                                     writerIncremental      = incremental,
+                                                     writerCiteMethod       = citeMethod,
+                                                     writerIgnoreNotes      = False,
+                                                     writerNumberSections   = numberSections,
+                                                     writerNumberOffset     = numberFrom,
+                                                     writerSectionDivs      = sectionDivs,
+                                                     writerReferenceLinks   = referenceLinks,
+                                                     writerWrapText         = wrap,
+                                                     writerColumns          = columns,
+                                                     writerEmailObfuscation = obfuscationMethod,
+                                                     writerIdentifierPrefix = idPrefix,
+                                                     writerSourceURL        = sourceURL,
+                                                     writerUserDataDir      = datadir,
+                                                     writerHtml5            = html5,
+                                                     writerHtmlQTags        = htmlQTags,
+                                                     writerChapters         = chapters,
+                                                     writerListings         = listings,
+                                                     writerBeamer           = False,
+                                                     writerSlideLevel       = slideLevel,
+                                                     writerHighlight        = highlight,
+                                                     writerHighlightStyle   = highlightStyle,
+                                                     writerSetextHeaders    = setextHeaders,
+                                                     writerTeXLigatures     = texLigatures,
+                                                     writerEpubMetadata     = epubMetadata,
+                                                     writerEpubStylesheet   = epubStylesheet,
+                                                     writerEpubFonts        = epubFonts,
+                                                     writerEpubChapterLevel = epubChapterLevel,
+                                                     writerTOCDepth         = epubTOCDepth,
+                                                     writerReferenceODT     = referenceODT,
+                                                     writerReferenceDocx    = referenceDocx,
+                                                     writerMediaBag         = media
+                                                   }
 
-  let writeBinary :: B.ByteString -> IO ()
-      writeBinary = B.writeFile (UTF8.encodePath outputFile)
 
-  let writerFn :: FilePath -> String -> IO ()
-      writerFn "-" = UTF8.putStr
-      writerFn f   = UTF8.writeFile f
+                           doc' <- (maybe return (extractMedia media) mbExtractMedia >=>
+                                    adjustMetadata metadata >=>
+                                    applyTransforms transforms >=>
+                                    applyFilters filters' [writerName']) doc
 
-  case writer of
-    IOStringWriter f -> f writerOptions doc' >>= writerFn outputFile
-    IOByteStringWriter f -> f writerOptions doc' >>= writeBinary
-    PureStringWriter f
-      | pdfOutput -> do
-              -- make sure writer is latex or beamer
-              unless laTeXOutput $
-                err 47 $ "cannot produce pdf output with " ++ writerName' ++
-                         " writer"
+                           let writeBinary :: B.ByteString -> IO ()
+                               writeBinary = B.writeFile (UTF8.encodePath out)
 
-              -- check for latex program
-              mbLatex <- findExecutable latexEngine
-              when (mbLatex == Nothing) $
-                   err 41 $ latexEngine ++ " not found. " ++
-                     latexEngine ++ " is needed for pdf output."
+                           let writerFn :: FilePath -> String -> IO ()
+                               writerFn "-" = UTF8.putStr
+                               writerFn f   = UTF8.writeFile f
 
-              res <- makePDF latexEngine f writerOptions doc'
-              case res of
-                   Right pdf -> writeBinary pdf
-                   Left err' -> do
-                     B.hPutStr stderr $ err'
-                     B.hPut stderr $ B.pack [10]
-                     err 43 "Error producing PDF from TeX source"
-      | otherwise -> selfcontain (f writerOptions doc' ++
-                                  ['\n' | not standalone'])
-                      >>= writerFn outputFile . handleEntities
-          where htmlFormat = writerName' `elem`
-                               ["html","html+lhs","html5","html5+lhs",
-                               "s5","slidy","slideous","dzslides","revealjs"]
-                selfcontain = if selfContained && htmlFormat
-                                 then makeSelfContained writerOptions
-                                 else return
-                handleEntities = if htmlFormat && ascii
-                                    then toEntities
-                                    else id
+                           case writer of
+                             IOStringWriter f -> f writerOptions doc' >>= writerFn out
+                             IOByteStringWriter f -> f writerOptions doc' >>= writeBinary
+                             PureStringWriter f
+                               | pdfOutput -> do
+                                       -- make sure writer is latex or beamer
+                                       unless laTeXOutput $
+                                         err 47 $ "cannot produce pdf output with " ++ writerName' ++
+                                                  " writer"
+
+                                       -- check for latex program
+                                       mbLatex <- findExecutable latexEngine
+                                       when (mbLatex == Nothing) $
+                                            err 41 $ latexEngine ++ " not found. " ++
+                                              latexEngine ++ " is needed for pdf output."
+
+                                       res <- makePDF latexEngine f writerOptions doc'
+                                       case res of
+                                            Right pdf -> writeBinary pdf
+                                            Left err' -> do
+                                              B.hPutStr stderr $ err'
+                                              B.hPut stderr $ B.pack [10]
+                                              err 43 "Error producing PDF from TeX source"
+                               | otherwise -> selfcontain (f writerOptions doc' ++
+                                                           ['\n' | not standalone'])
+                                               >>= writerFn out . handleEntities
+                                   where htmlFormat = writerName' `elem`
+                                                        ["html","html+lhs","html5","html5+lhs",
+                                                        "s5","slidy","slideous","dzslides","revealjs"]
+                                         selfcontain = if selfContained && htmlFormat
+                                                          then makeSelfContained writerOptions
+                                                          else return
+                                         handleEntities = if htmlFormat && ascii
+                                                             then toEntities
+                                                             else id
+  if batch then mapM_ (\(i, o) -> process [i] o) (zip inputFiles outputFiles) else process sources outputFile
